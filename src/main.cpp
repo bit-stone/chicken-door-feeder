@@ -20,6 +20,7 @@
 // light change analog value
 // brighter -> higher voltage -> higher value
 #define LIGHT_CHANGE_ADV_VALUE 585
+// #define LIGHT_CHANGE_ADV_VALUE 232
 
 #define STATE_CHANGE_COUNT 10
 
