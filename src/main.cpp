@@ -6,7 +6,7 @@
 #include <avr/sleep.h>
 
 // MAX Settings
-#define MAX_MOVEMENT_COUNTER 360 // about 180 seconds
+#define MAX_MOVEMENT_COUNTER 70 // watchdog timer counts twice per second
 #define FEEDER_DURATION_MS 2000
 
 // bottle is empty after about 50 seconds of continous running
