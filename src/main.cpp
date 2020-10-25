@@ -7,8 +7,12 @@
 
 // MAX Settings
 #define MAX_MOVEMENT_COUNTER 360 // about 180 seconds
-#define FEEDER_DURATION_MS 2500
-#define FEEDER_DELAY_COUNT 30
+#define FEEDER_DURATION_MS 2000
+
+// bottle is empty after about 50 seconds of continous running
+// so for about 6 hours there need to be 864 seconds between runs. 
+// or about 108 delays. 
+#define FEEDER_DELAY_COUNT 108
 
 // must be lower then 16 bit for all 1024 values (65535 / 1024 = 63,9)
 // MAX value is 63
@@ -19,8 +23,8 @@
 
 // light change analog value
 // brighter -> higher voltage -> higher value
-#define LIGHT_CHANGE_ADV_VALUE 585
-// #define LIGHT_CHANGE_ADV_VALUE 232
+// #define LIGHT_CHANGE_ADV_VALUE 585
+#define LIGHT_CHANGE_ADV_VALUE 240
 
 #define STATE_CHANGE_COUNT 10
 
@@ -267,9 +271,11 @@ ISR(INT1_vect)
     setState(STATE_RELEASE_LOWER_SWITCH);
   }
 
-  if(state == STATE_STATIONARY_DOWN) {
-    setState(STATE_MOVING_UP);
-  }
+  // removed -> to dangerous if animals hit it by accident
+  // same could be achieved by simple reset
+  // if(state == STATE_STATIONARY_DOWN) {
+  //   setState(STATE_MOVING_UP);
+  // }
 }
 
 ISR(WDT_vect)
