@@ -7,12 +7,6 @@
 
 // MAX Settings
 #define MAX_MOVEMENT_COUNTER 70 // watchdog timer counts twice per second
-#define FEEDER_DURATION_MS 2000
-
-// bottle is empty after about 50 seconds of continous running
-// so for about 6 hours there need to be 864 seconds between runs. 
-// or about 108 delays. 
-#define FEEDER_DELAY_COUNT 108
 
 // must be lower then 16 bit for all 1024 values (65535 / 1024 = 63,9)
 // MAX value is 63
@@ -202,21 +196,6 @@ void releaseSwitch(uint8_t switchType)
   }
 }
 
-void tickFeeder()
-{
-  if (state == STATE_STATIONARY_UP)
-  {
-    feederCounter++;
-    if (feederCounter >= FEEDER_DELAY_COUNT)
-    {
-      PORTB |= (1 << MOTOR_FEEDER_PIN);
-      _delay_ms(FEEDER_DURATION_MS);
-      PORTB &= ~(1 << MOTOR_FEEDER_PIN);
-      feederCounter = 0;
-    }
-  }
-}
-
 void measureAnalogValue(uint8_t analogChannel) {
   // check max value of channel 
   // to avoid changing of other settings
@@ -388,11 +367,6 @@ int main()
             } else {
               stateChangeCounter = 0;
               PORTB &= ~(1 << LED_STATUS_PIN);
-            }
-
-            // tick the feeder
-            if(stateChangeCounter == 0) {
-              tickFeeder();
             }
 
             if(stateChangeCounter > STATE_CHANGE_COUNT) {
