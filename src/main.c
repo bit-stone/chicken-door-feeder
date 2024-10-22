@@ -11,7 +11,7 @@
 // must be lower then 16 bit for all 1024 values (65535 / 1024 = 63,9)
 // MAX value is 63
 #define ANALOG_MEASUREMENT_FREERUN_US 10
-#define ANALOG_MEASUREMENT_COUNT 10 
+#define ANALOG_MEASUREMENT_COUNT 10
 
 #define ADMUX_VALUE 0x00;
 
@@ -196,10 +196,12 @@ void releaseSwitch(uint8_t switchType)
   }
 }
 
-void measureAnalogValue(uint8_t analogChannel) {
-  // check max value of channel 
+void measureAnalogValue(uint8_t analogChannel)
+{
+  // check max value of channel
   // to avoid changing of other settings
-  if(analogChannel > 15) {
+  if (analogChannel > 15)
+  {
     analogChannel = 15;
   }
 
@@ -216,9 +218,13 @@ void measureAnalogValue(uint8_t analogChannel) {
   analogInput = 0;
 
   // read current values
-  while(analogCount <= ANALOG_MEASUREMENT_COUNT) {
+  while (analogCount <= ANALOG_MEASUREMENT_COUNT)
+  {
     ADCSRA |= (1 << ADSC);
-    while(bit_is_set(ADCSRA, ADSC)) {;}
+    while (bit_is_set(ADCSRA, ADSC))
+    {
+      ;
+    }
     analogInput = ADCW;
     analogValue += analogInput;
     analogCount++;
@@ -237,7 +243,8 @@ ISR(INT0_vect)
     setState(STATE_RELEASE_UPPER_SWITCH);
   }
 
-  if(state == STATE_STATIONARY_UP) {
+  if (state == STATE_STATIONARY_UP)
+  {
     setState(STATE_MOVING_DOWN);
   }
 }
@@ -297,15 +304,17 @@ int main()
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   sei();
 
-
   // watchdog timer
   setWatchdogTimer(WDT_8000MS);
 
-  // check if upper switch is pressed 
+  // check if upper switch is pressed
   // otherwise move up
-  if (bit_is_clear(PIND, PD2)) {
+  if (bit_is_clear(PIND, PD2))
+  {
     setState(STATE_RELEASE_UPPER_SWITCH);
-  } else {
+  }
+  else
+  {
     setState(STATE_MOVING_UP);
   }
 
@@ -361,15 +370,19 @@ int main()
 
             // measure brightness
             measureAnalogValue(ADC_CHANNEL_LIGHT);
-            if (analogValue <= LIGHT_CHANGE_ADV_VALUE) {
+            if (analogValue <= LIGHT_CHANGE_ADV_VALUE)
+            {
               stateChangeCounter++;
               PORTB |= (1 << LED_STATUS_PIN);
-            } else {
+            }
+            else
+            {
               stateChangeCounter = 0;
               PORTB &= ~(1 << LED_STATUS_PIN);
             }
 
-            if(stateChangeCounter > STATE_CHANGE_COUNT) {
+            if (stateChangeCounter > STATE_CHANGE_COUNT)
+            {
               setState(STATE_MOVING_DOWN);
             }
             break;
@@ -382,21 +395,25 @@ int main()
             _delay_ms(150);
 
             measureAnalogValue(ADC_CHANNEL_LIGHT);
-            if (analogValue >= LIGHT_CHANGE_ADV_VALUE) {
+            if (analogValue >= LIGHT_CHANGE_ADV_VALUE)
+            {
               stateChangeCounter++;
               PORTB |= (1 << LED_STATUS_PIN);
-            } else {
+            }
+            else
+            {
               stateChangeCounter = 0;
               PORTB &= ~(1 << LED_STATUS_PIN);
             }
 
-            if(stateChangeCounter > STATE_CHANGE_COUNT) {
+            if (stateChangeCounter > STATE_CHANGE_COUNT)
+            {
               setState(STATE_MOVING_UP);
             }
             break;
           default:
             break;
-          }          
+          }
           watchDogTimerFlag = 0;
           ADCSRA &= ~(1 << ADEN);
           sei();
