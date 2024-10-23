@@ -1,425 +1,495 @@
-
 #include <avr/io.h>
 #include <stddef.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
 #include <avr/sleep.h>
 
-// MAX Settings
-#define MAX_MOVEMENT_COUNTER 70 // watchdog timer counts twice per second
+#include "led.h"
+#include "motor.h"
+#include "analog.h"
 
-// must be lower then 16 bit for all 1024 values (65535 / 1024 = 63,9)
-// MAX value is 63
-#define ANALOG_MEASUREMENT_FREERUN_US 10
-#define ANALOG_MEASUREMENT_COUNT 10
+// the different states of this component
+// sleep() is only used within the IDLE_XX states
+// the order matters, as apart from STATE_ERROR every next state can
+// only be transitions to from the previous state.
+#define STATE_ERROR 0
+#define STATE_MOVING_UP 1
+#define STATE_RELEASING_UP 2
+#define STATE_IDLE_UP 3
+#define STATE_MOVING_DOWN 4
+#define STATE_RELEASING_DOWN 5
+#define STATE_IDLE_DOWN 6
 
-#define ADMUX_VALUE 0x00;
+// where the NC endstops are connected
+// need to be on INT0/1
+#define LIMIT_SWITCH_PORT PORTD
+#define LIMIT_SWITCH_DDR DDRD
+#define LIMIT_SWITCH_PIN PIND
+#define LIMIT_SWITCH_UP_PIN PD2
+#define LIMIT_SWITCH_DOWN_PIN PD3
 
-// light change analog value
-// brighter -> higher voltage -> higher value
-// #define LIGHT_CHANGE_ADV_VALUE 585
-#define LIGHT_CHANGE_ADV_VALUE 240
+// settings to prevent human read errors :)
+#define FLAG_TRUE 1
+#define FLAG_FALSE 0
 
-#define STATE_CHANGE_COUNT 10
+// return values for when a delay was completed or aborted
+#define DELAY_COMPLETED 1
+#define DELAY_ABORTED 0
 
-// Definitions ------------------------------------------------------
-#define MOTOR_DOOR_PIN_UP PD7
-#define MOTOR_DOOR_PIN_DOWN PD6
+// the minimum delay between flag checks for state transitions
+// this delay will be the maximum time between requesting
+// a transition and the code actually doing one
+#define DELAY_TICK_MS 5
 
-// #define MOTOR_FEEDER_PIN PD5
-#define MOTOR_FEEDER_PIN PB7
+// the amount of ticks until a timeout is reached for MOVING_UP/MOVING_DOWN
+// One tick thereby is one complete while-round and mostly depends on the amount
+// of _delay_ms() used. For 2x500ms this would be around 60 seconds.
+#define MOVING_STATE_TICK_MAX_COUNT 60
 
-// #define MOTOR_DOOR_ENABLE_PIN PB2
-#define MOTOR_DOOR_ENABLE_PIN PD5
+// for relase, the tick is much shorter (100ms)
+#define RELEASE_STATE_TICK_MAX_COUNT 20
 
-#define UPPER_SWITCH_PIN PD2
-#define LOWER_SWITCH_PIN PD3
+// channel on which the light level is measured
+#define ANALOG_CHANNEL_LIGHT 0
 
-#define LED_BATTERY_PIN PB1
-#define LED_STATUS_PIN PB0
+// if set, the transition will be done
+// afterwards, flag has to be reset to zero
+uint8_t state_transition_flag = FLAG_TRUE;
 
-#define ADC_CHANNEL_LIGHT 1
+// if set, the idle mode will reset the light level to the
+// next measure from analog input. value will be in EEPROM
+uint8_t set_light_level_flag = 0;
 
-#define STATE_MOVING_UP 0
-#define STATE_MOVING_DOWN 1
-#define STATE_STATIONARY_UP 2
-#define STATE_STATIONARY_DOWN 3
-#define STATE_RELEASE_UPPER_SWITCH 4
-#define STATE_RELEASE_LOWER_SWITCH 5
-#define STATE_ERROR 6
+// current state
+uint8_t current_state = STATE_MOVING_UP;
 
-#define MOTOR_DOOR_DIRECTION_UP 10
-#define MOTOR_DOOR_DIRECTION_DOWN 11
-#define MOTOR_DOOR_STOP 12
+// delay return value
+uint8_t delay_consumed = 0;
 
-#define WDT_16MS 64   //    0        1         0         0        0        0          0          0
-#define WDT_32MS 65   //    0        1         0         0        0        0          0          1
-#define WDT_64MS 66   //    0        1         0         0        0        0          1          0
-#define WDT_125MS 67  //    0        1         0         0        0        0          1          1
-#define WDT_250MS 68  //    0        1         0         0        0        0          0          0
-#define WDT_500MS 69  //    0        1         0         0        0        1          0          0
-#define WDT_1000MS 70 //    0        1         0         0        0        1          0          1
-#define WDT_2000MS 71 //    0        1         0         0        0        1          1          1
-#define WDT_4000MS 96 //    0        1         1         0        0        0          0          0
-#define WDT_8000MS 97
+// amount of ticks used in current movement
+uint8_t movement_tick_count = 0;
+uint8_t release_tick_count = 0;
 
-volatile uint16_t analogInput = 0;
-volatile uint8_t analogCount = 0;
-volatile uint16_t analogValue = 0;
+// used to store the currently measured light level
+uint16_t light_level = 0;
 
-volatile uint8_t state = STATE_STATIONARY_UP;
-volatile uint8_t inMovement = 0;
+// light_level to check against. Read from EEPROM.
+// to prevent unneccesary state changes, it has to be lower for moving down
+// than for moving up (about 5% or something maybe?)
+uint16_t target_light_level = 0;
 
-uint8_t releaseCounter = 0;
-uint16_t movementCounter = 0;
-uint16_t feederCounter = 0;
+// IMPORTANT: This is only used when the EEPROM value is read as 0!
+// Otherwise the eeprom value will be used.
+#define FALLBACK_TARGET_LIGHT_LEVEL 500
 
-uint8_t watchDogTimerFlag = 0;
+// counter
+uint8_t k = 0;
+uint8_t l = 0;
 
-uint8_t stateChangeCounter = 0;
-
-// Global methods ------------------------------------------------------
-
-// enable door motor h-bridge
-void enableDoorMotor()
+/**
+ * Request a state transition to a new state
+ */
+void request_transition(uint8_t target_state)
 {
-  PORTD |= (1 << MOTOR_DOOR_ENABLE_PIN);
-}
-
-// disable door motor h-brigde
-void disableDoorMotor()
-{
-  PORTD &= ~(1 << MOTOR_DOOR_ENABLE_PIN);
-}
-
-void setWatchdogTimer(uint8_t input)
-{
-  cli();
-  MCUSR &= ~(1 << WDRF);
-  WDTCSR = (1 << WDCE) | (1 << WDE);
-  WDTCSR = input;
-  sei();
-}
-
-// set door motor direction or stop it
-void setDoorMotor(uint8_t direction)
-{
-  switch (direction)
+  if (target_state == current_state)
   {
-  case MOTOR_DOOR_DIRECTION_UP:
-    inMovement = 1;
-    enableDoorMotor();
-    PORTD &= ~(1 << MOTOR_DOOR_PIN_DOWN);
-    _delay_ms(50);
-    PORTD |= (1 << MOTOR_DOOR_PIN_UP);
-    break;
-  case MOTOR_DOOR_DIRECTION_DOWN:
-    inMovement = 1;
-    enableDoorMotor();
-    PORTD &= ~(1 << MOTOR_DOOR_PIN_UP);
-    _delay_ms(50);
-    PORTD |= (1 << MOTOR_DOOR_PIN_DOWN);
-    break;
-  case MOTOR_DOOR_STOP:
-    inMovement = 0;
-    disableDoorMotor();
-    PORTD &= ~(1 << MOTOR_DOOR_PIN_DOWN);
-    PORTD &= ~(1 << MOTOR_DOOR_PIN_UP);
-    break;
+    return;
   }
-}
 
-void setState(uint8_t newState)
-{
-  cli();
-  if (newState != state)
+  if (target_state == STATE_ERROR)
   {
-    switch (newState)
+    // switching to error state is always allowed
+    state_transition_flag = FLAG_TRUE;
+    current_state = STATE_ERROR;
+    return;
+  }
+
+  if (target_state != STATE_MOVING_UP)
+  {
+    if (target_state == current_state + 1)
     {
-    case STATE_MOVING_UP:
-      setWatchdogTimer(WDT_500MS);
-      setDoorMotor(MOTOR_DOOR_DIRECTION_UP);
-      break;
-    case STATE_MOVING_DOWN:
-      setWatchdogTimer(WDT_500MS);
-      setDoorMotor(MOTOR_DOOR_DIRECTION_DOWN);
-      break;
-    case STATE_STATIONARY_UP:
-      setWatchdogTimer(WDT_8000MS);
-      setDoorMotor(MOTOR_DOOR_STOP);
-      PORTB &= ~(1 << LED_STATUS_PIN);
-      break;
-    case STATE_STATIONARY_DOWN:
-      setWatchdogTimer(WDT_8000MS);
-      setDoorMotor(MOTOR_DOOR_STOP);
-      PORTB &= ~(1 << LED_STATUS_PIN);
-      break;
-    case STATE_RELEASE_UPPER_SWITCH:
-      setWatchdogTimer(WDT_500MS);
-      setDoorMotor(MOTOR_DOOR_DIRECTION_DOWN);
-      break;
-    case STATE_RELEASE_LOWER_SWITCH:
-      setWatchdogTimer(WDT_500MS);
-      setDoorMotor(MOTOR_DOOR_DIRECTION_UP);
-      break;
-    case STATE_ERROR:
-      setWatchdogTimer(WDT_8000MS);
-      setDoorMotor(MOTOR_DOOR_STOP);
-      break;
+      state_transition_flag = FLAG_TRUE;
+      current_state = target_state;
+      return;
     }
-    state = newState;
-    movementCounter = 0;
-    releaseCounter = 0;
-  }
-  sei();
-}
-
-void releaseSwitch(uint8_t switchType)
-{
-  releaseCounter = 0;
-  while (bit_is_clear(PIND, switchType))
-  {
-    releaseCounter++;
-    if (releaseCounter > 100)
-    {
-      break;
-    }
-    _delay_ms(20);
-  }
-  if (releaseCounter <= 100)
-  {
-    setState((switchType == UPPER_SWITCH_PIN ? STATE_STATIONARY_UP : STATE_STATIONARY_DOWN));
   }
   else
   {
-    setState(STATE_ERROR);
-  }
-}
-
-void measureAnalogValue(uint8_t analogChannel)
-{
-  // check max value of channel
-  // to avoid changing of other settings
-  if (analogChannel > 15)
-  {
-    analogChannel = 15;
-  }
-
-  // set analog channel
-  ADCSRA |= (1 << ADEN);
-  ADCSRA |= (1 << ADPS2);
-  ADMUX |= (ADMUX & 0xF0) | (analogChannel & 0x0F);
-
-  // stabilizing time
-  _delay_us(ANALOG_MEASUREMENT_FREERUN_US);
-
-  // reset values
-  analogCount = 0;
-  analogInput = 0;
-
-  // read current values
-  while (analogCount <= ANALOG_MEASUREMENT_COUNT)
-  {
-    ADCSRA |= (1 << ADSC);
-    while (bit_is_set(ADCSRA, ADSC))
+    // have to handle STATE_IDLE_DOWN because of wrapping around
+    if (current_state == STATE_IDLE_DOWN)
     {
-      ;
+      state_transition_flag = FLAG_TRUE;
+      current_state = target_state;
+      return;
     }
-    analogInput = ADCW;
-    analogValue += analogInput;
-    analogCount++;
   }
-
-  // calculate average
-  analogValue = analogValue / analogCount;
 }
 
-// Interrupts ----------------------------------------------------------
+// delay for a certain amount. If the flag is set before
+// time runs out, return 0 to show, that a break needs to happen
+uint8_t delay_and_check_flag(uint16_t amount)
+{
+  for (l = 0; l < (amount / DELAY_TICK_MS); l++)
+  {
+    _delay_ms(DELAY_TICK_MS);
+    if (state_transition_flag == FLAG_TRUE)
+    {
+      return DELAY_ABORTED;
+    }
+  }
+
+  return DELAY_COMPLETED;
+}
+
+// ~~~~~~~~~~~~~~~~~~ ISR ~~~~~~~~~~~~~~~~~~
+// INT0 = PD2 = green = upper switch was depressed (low -> high transition)
 ISR(INT0_vect)
 {
-  // upper switch made contact
-  if (state == STATE_MOVING_UP)
+  // the motor was moving up and the upper limit switch has been pressed
+  if (current_state == STATE_MOVING_UP && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
   {
-    setState(STATE_RELEASE_UPPER_SWITCH);
+    request_transition(STATE_RELEASING_UP);
+    return;
   }
 
-  if (state == STATE_STATIONARY_UP)
+  // the motor was moving down (to release) and the upper limit switch has been released
+  if (current_state == STATE_RELEASING_UP && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
   {
-    setState(STATE_MOVING_DOWN);
+    request_transition(STATE_IDLE_UP);
+    return;
   }
 }
 
 ISR(INT1_vect)
 {
-  // lower switch made contact
-  if (state == STATE_MOVING_DOWN)
+  // the motor was moving down and the lower limit switch has been pressed
+  if (current_state == STATE_MOVING_DOWN && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
   {
-    setState(STATE_RELEASE_LOWER_SWITCH);
+    request_transition(STATE_RELEASING_DOWN);
+    return;
   }
 
-  // removed -> to dangerous if animals hit it by accident
-  // same could be achieved by simple reset
-  // if(state == STATE_STATIONARY_DOWN) {
-  //   setState(STATE_MOVING_UP);
-  // }
-}
-
-ISR(WDT_vect)
-{
-  if (inMovement == 1)
+  // the motor was moving up (to release) and the lower limit switch has been released
+  if (current_state == STATE_RELEASING_DOWN && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
   {
-    PORTB ^= (1 << LED_STATUS_PIN);
-  }
-
-  if (watchDogTimerFlag == 0)
-  {
-    watchDogTimerFlag = 1;
+    request_transition(STATE_IDLE_DOWN);
+    return;
   }
 }
 
-// main ------------------------------------------------------
+// ##########################################################################
 int main()
 {
-  // init outputs for LED
-  DDRB |= (1 << LED_BATTERY_PIN) | (1 << LED_STATUS_PIN);
+  // startup stuff
+  led_init();
+  motor_init();
 
-  // init outputs for motor
-  DDRB |= (1 << MOTOR_FEEDER_PIN);
-  DDRD |= (1 << MOTOR_DOOR_PIN_DOWN) | (1 << MOTOR_DOOR_PIN_UP);
-  DDRD |= (1 << MOTOR_DOOR_ENABLE_PIN);
+  // read target light level from eeprom.
+  // if 0, set the default value
 
-  PORTB &= ~(1 << MOTOR_FEEDER_PIN);
-  PORTD &= ~((1 << MOTOR_DOOR_PIN_DOWN) | (1 << MOTOR_DOOR_PIN_UP));
+  if (target_light_level == 0)
+  {
+    target_light_level = FALLBACK_TARGET_LIGHT_LEVEL;
+  }
 
-  // init inputs for INT0/1 with pullup
-  DDRD &= ~((1 << UPPER_SWITCH_PIN) | (1 << LOWER_SWITCH_PIN));
-  PORTD |= (1 << UPPER_SWITCH_PIN) | (1 << LOWER_SWITCH_PIN);
+  // setting both interrupts to trigger on low-high-transition
+  // and have the pullup enabled
+  LIMIT_SWITCH_DDR &= ~((1 << LIMIT_SWITCH_UP_PIN) | 1 << LIMIT_SWITCH_DOWN_PIN);
+  LIMIT_SWITCH_PORT |= (1 << LIMIT_SWITCH_UP_PIN) | (1 << LIMIT_SWITCH_DOWN_PIN);
 
-  // set INT0/1 to trigger at any logical change
+  // setting both interrupts to trigger on any logic level change
+  // (low->high for endstop, high->low for release needed)
   EICRA |= (1 << ISC10) | (1 << ISC00);
+
+  // enable both interrupts
   EIMSK |= (1 << INT1) | (1 << INT0);
 
-  ADMUX = ADMUX_VALUE;
+  // show led startup animation
+  led_on();
+  _delay_ms(50);
+  led_off();
+  _delay_ms(50);
 
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  led_on();
+  _delay_ms(50);
+  led_off();
+  _delay_ms(50);
+
+  led_on();
+  _delay_ms(50);
+  led_off();
+  _delay_ms(500);
+
+  // enable interrupts globally
   sei();
 
-  // watchdog timer
-  setWatchdogTimer(WDT_8000MS);
-
-  // check if upper switch is pressed
-  // otherwise move up
-  if (bit_is_clear(PIND, PD2))
+  // if the upper end switch is pressed already,
+  // prevent damage by setting the release_upper state
+  if (bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
   {
-    setState(STATE_RELEASE_UPPER_SWITCH);
-  }
-  else
-  {
-    setState(STATE_MOVING_UP);
+    current_state = STATE_RELEASING_UP;
+    state_transition_flag = FLAG_TRUE;
   }
 
-  // main loop ------------------------------------------------------
+  // loop
   while (1)
   {
-    if (state == STATE_ERROR)
+    switch (current_state)
     {
-      // blink status LED very fast
-      PORTB ^= (1 << LED_STATUS_PIN);
-      _delay_ms(100);
-    }
-    else
-    {
-      if (inMovement == 1)
+    // ERROR STATE
+    // ~~~~~~~~~~~~~~~~~~~~~~ STATE_ERROR ~~~~~~~~~~~~~~~~~~~~
+    case STATE_ERROR:
+      if (state_transition_flag == FLAG_TRUE)
       {
-        if (state == STATE_RELEASE_UPPER_SWITCH)
+        state_transition_flag = FLAG_FALSE;
+        // disable all interrupts
+        cli();
+        // stop all movement
+        motor_stop();
+        // reset the LED
+        led_off();
+      }
+
+      // blink kind of fast
+      led_on();
+      delay_consumed = delay_and_check_flag(50);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      led_off();
+      delay_consumed = delay_and_check_flag(250);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      break;
+
+    // MOVING UP AND DOWN
+    // ~~~~~~~~~~~~~~~~~~~~~~ STATE_MOVING_UP ~~~~~~~~~~~~~~~~~~~~
+    case STATE_MOVING_UP:
+      if (state_transition_flag == FLAG_TRUE)
+      {
+        state_transition_flag = FLAG_FALSE;
+        // reset LED
+        led_off();
+        // start moving up
+        motor_move_up();
+        // reset move tick count
+        movement_tick_count = 0;
+      }
+
+      led_on();
+      delay_consumed = delay_and_check_flag(500);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      led_off();
+      delay_consumed = delay_and_check_flag(500);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      movement_tick_count++;
+
+      if (movement_tick_count > MOVING_STATE_TICK_MAX_COUNT)
+      {
+        request_transition(STATE_ERROR);
+        break;
+      }
+
+      break;
+    // ~~~~~~~~~~~~~~~~~~~~~~ STATE_MOVING_DOWN ~~~~~~~~~~~~~~~~~~~~
+    case STATE_MOVING_DOWN:
+      if (state_transition_flag == FLAG_TRUE)
+      {
+        state_transition_flag = FLAG_FALSE;
+        // reset LED
+        led_off();
+        // start moving down
+        motor_move_down();
+        // reset move tick count
+        movement_tick_count = 0;
+      }
+
+      led_on();
+      delay_consumed = delay_and_check_flag(500);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      led_off();
+      delay_consumed = delay_and_check_flag(500);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      movement_tick_count++;
+
+      if (movement_tick_count > MOVING_STATE_TICK_MAX_COUNT)
+      {
+        request_transition(STATE_ERROR);
+        break;
+      }
+
+      break;
+    // RELEASING UP AND DOWN
+    // ~~~~~~~~~~~~~~~~~~~~~~ STATE_RELEASING_UP ~~~~~~~~~~~~~~~~~~~~
+    case STATE_RELEASING_UP:
+      if (state_transition_flag == FLAG_TRUE)
+      {
+        state_transition_flag = FLAG_FALSE;
+        // reset LED (always on in release state)
+        led_on();
+        // start moving down (to release upper switch)
+        motor_move_down();
+        // reset release ticks
+        release_tick_count = 0;
+      }
+
+      delay_consumed = delay_and_check_flag(100);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      release_tick_count++;
+      if (release_tick_count > RELEASE_STATE_TICK_MAX_COUNT)
+      {
+        request_transition(STATE_ERROR);
+        break;
+      }
+
+      break;
+    // ~~~~~~~~~~~~~~~~~~~~~~ STATE_RELEASING_DOWN ~~~~~~~~~~~~~~~~~~~~
+    case STATE_RELEASING_DOWN:
+      if (state_transition_flag == FLAG_TRUE)
+      {
+        state_transition_flag = FLAG_FALSE;
+        // reset LED (always on in release state)
+        led_on();
+        // start moving up
+        motor_move_up();
+        // reset release ticks
+        release_tick_count = 0;
+      }
+
+      delay_consumed = delay_and_check_flag(100);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      release_tick_count++;
+      if (release_tick_count > RELEASE_STATE_TICK_MAX_COUNT)
+      {
+        request_transition(STATE_ERROR);
+        break;
+      }
+
+      break;
+
+    // IDLE STATES
+    // ~~~~~~~~~~~~~~~~~~~~~~ STATE_IDLE_UP ~~~~~~~~~~~~~~~~~~~~
+    case STATE_IDLE_UP:
+      if (state_transition_flag == FLAG_TRUE)
+      {
+        state_transition_flag = FLAG_FALSE;
+
+        // reset LED
+        led_off();
+        // stop all movement
+        motor_stop();
+
+        // show idle transition led signal
+        for (k = 0; k < 5; k++)
         {
-          releaseSwitch(UPPER_SWITCH_PIN);
-        }
-        else if (state == STATE_RELEASE_LOWER_SWITCH)
-        {
-          releaseSwitch(LOWER_SWITCH_PIN);
-        }
-        if (watchDogTimerFlag == 1)
-        {
-          movementCounter++;
-          if (movementCounter > MAX_MOVEMENT_COUNTER)
+          led_off();
+          delay_consumed = delay_and_check_flag(100);
+          if (delay_consumed == DELAY_ABORTED)
           {
-            setState(STATE_ERROR);
+            break;
           }
-          watchDogTimerFlag = 0;
+
+          led_on();
+          delay_consumed = delay_and_check_flag(400);
+          if (delay_consumed == DELAY_ABORTED)
+          {
+            break;
+          }
+
+          led_off();
         }
       }
-      else
+
+      led_on();
+      // measure brightness
+      analog_measure_value(ANALOG_CHANNEL_LIGHT, &light_level);
+
+      if (set_light_level_flag == FLAG_TRUE)
       {
-        if (watchDogTimerFlag == 1)
+        // if the button was pressed set new value for brightness
+        // wanted behaviour: If pressed while in STATE_IDLE_UP, the door should go into
+        // closing behavior on the next blink
+      }
+
+      led_off();
+
+      break;
+    // ~~~~~~~~~~~~~~~~~~~~~~ STATE_IDLE_DOWN ~~~~~~~~~~~~~~~~~~~~
+    case STATE_IDLE_DOWN:
+      if (state_transition_flag == FLAG_TRUE)
+      {
+        state_transition_flag = FLAG_FALSE;
+        // reset LED
+        led_off();
+        // stop all movement
+        motor_stop();
+
+        // show idle transition led signal
+        for (k = 0; k < 2; k++)
         {
-          cli();
-          switch (state)
+          led_off();
+          delay_consumed = delay_and_check_flag(100);
+          if (delay_consumed == DELAY_ABORTED)
           {
-          case STATE_STATIONARY_UP:
-            PORTB &= ~(1 << LED_STATUS_PIN);
-            _delay_ms(150);
-            PORTB |= (1 << LED_STATUS_PIN);
-            _delay_ms(100);
-            PORTB &= ~(1 << LED_STATUS_PIN);
-            _delay_ms(150);
-            PORTB |= (1 << LED_STATUS_PIN);
-            _delay_ms(100);
-            PORTB &= ~(1 << LED_STATUS_PIN);
-            _delay_ms(150);
-
-            // measure brightness
-            measureAnalogValue(ADC_CHANNEL_LIGHT);
-            if (analogValue <= LIGHT_CHANGE_ADV_VALUE)
-            {
-              stateChangeCounter++;
-              PORTB |= (1 << LED_STATUS_PIN);
-            }
-            else
-            {
-              stateChangeCounter = 0;
-              PORTB &= ~(1 << LED_STATUS_PIN);
-            }
-
-            if (stateChangeCounter > STATE_CHANGE_COUNT)
-            {
-              setState(STATE_MOVING_DOWN);
-            }
-            break;
-          case STATE_STATIONARY_DOWN:
-            PORTB &= ~(1 << LED_STATUS_PIN);
-            _delay_ms(150);
-            PORTB |= (1 << LED_STATUS_PIN);
-            _delay_ms(100);
-            PORTB &= ~(1 << LED_STATUS_PIN);
-            _delay_ms(150);
-
-            measureAnalogValue(ADC_CHANNEL_LIGHT);
-            if (analogValue >= LIGHT_CHANGE_ADV_VALUE)
-            {
-              stateChangeCounter++;
-              PORTB |= (1 << LED_STATUS_PIN);
-            }
-            else
-            {
-              stateChangeCounter = 0;
-              PORTB &= ~(1 << LED_STATUS_PIN);
-            }
-
-            if (stateChangeCounter > STATE_CHANGE_COUNT)
-            {
-              setState(STATE_MOVING_UP);
-            }
-            break;
-          default:
             break;
           }
-          watchDogTimerFlag = 0;
-          ADCSRA &= ~(1 << ADEN);
-          sei();
-          sleep_mode();
+
+          led_on();
+          delay_consumed = delay_and_check_flag(400);
+          if (delay_consumed == DELAY_ABORTED)
+          {
+            break;
+          }
         }
+
+        led_off();
       }
+
+      led_on();
+      // measure brightness (again?)
+      if (set_light_level_flag == FLAG_TRUE)
+      {
+        // if the button was pressed set new value for brightness
+        // wanted behaviour: If pressed while in STATE_IDLE_UP, the door should go into
+        // closing behavior on the next blink
+      }
+      led_off();
+
+      break;
+
+    // this should never happen :)
+    default:
+      request_transition(STATE_ERROR);
+      break;
     }
   }
 
