@@ -7,12 +7,15 @@
 
 // which pin to use for enabling the output motor 
 // -> h-bridge will be powered
-#define MOTOR_ENABLE_PIN PD4
+#define MOTOR_ENABLE_PIN PD5
 
 // which pins need to be set to high to make the motor move in that direction
 // IMPORTANT: Never set both high, as that will short out the h-bridge
 #define MOTOR_UP_PIN PD7
 #define MOTOR_DOWN_PIN PD6
+
+// ms of delay between changes to the movement to prevent shorts
+#define MOTOR_SWITCH_DELAY_MS 100
 
 void motor_init();
 

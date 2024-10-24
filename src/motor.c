@@ -28,7 +28,7 @@ void motor_move_up()
     // to avoid a short
 
     MOTOR_PORT &= ~(1 << MOTOR_DOWN_PIN);
-    _delay_ms(50);
+    _delay_ms(MOTOR_SWITCH_DELAY_MS);
     MOTOR_PORT |= (1 << MOTOR_UP_PIN);
 }
 
@@ -39,7 +39,7 @@ void motor_move_down()
     // to avoid a short
 
     MOTOR_PORT &= ~(1 << MOTOR_UP_PIN);
-    _delay_ms(50);
+    _delay_ms(MOTOR_SWITCH_DELAY_MS);
     MOTOR_PORT |= (1 << MOTOR_DOWN_PIN);
 }
 

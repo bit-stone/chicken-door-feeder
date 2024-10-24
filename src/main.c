@@ -4,6 +4,7 @@
 #include <util/delay.h>
 #include <avr/sleep.h>
 #include <avr/eeprom.h>
+#include <avr/wdt.h>
 
 #include "led.h"
 #include "motor.h"
@@ -51,7 +52,7 @@
 #define RELEASE_STATE_TICK_MAX_COUNT 20
 
 // channel on which the light level is measured
-#define ANALOG_CHANNEL_LIGHT 0
+#define ANALOG_CHANNEL_LIGHT 2
 
 // amount of ticks after which idle state changes to moving
 #define IDLE_TO_MOVING_TICK_COUNT 20
@@ -62,7 +63,7 @@ uint8_t state_transition_flag = FLAG_TRUE;
 
 // if set, the idle mode will reset the light level to the
 // next measure from analog input. value will be in EEPROM
-uint8_t set_light_level_flag = 0;
+uint8_t set_light_level_flag = FLAG_FALSE;
 
 // current state
 uint8_t current_state = STATE_MOVING_UP;
@@ -78,7 +79,7 @@ uint8_t release_tick_count = 0;
 uint8_t idle_tick_count = 0;
 
 // used to store the currently measured light level
-uint16_t light_level = 0;
+uint16_t light_level = 1024;
 
 // light_level to check against. Read from EEPROM.
 // to prevent unneccesary state changes, it has to be lower for moving down
@@ -89,11 +90,20 @@ uint16_t target_light_level = 0;
 // Otherwise the eeprom value will be used.
 #define FALLBACK_TARGET_LIGHT_LEVEL 500
 
-#define EEPROM_LIGHT_LEVEL_ADDRESS 69 // nice
+// this will be multiplied with the current light level while in IDLE_DOWN
+// to prevent the door from opening up again. Meaning:
+// To go up, it has to be a bit brigther compared to going down.
+// Also: To go down, it has to be a bit darker compared to going up.
+// This factor should be < 1.0
+#define LIGHT_LEVEL_DOWN_SUBTRACT_VALUE 25
+
+#define EEPROM_LIGHT_LEVEL_ADDRESS 4
 
 // counter
-uint8_t k = 0;
-uint8_t l = 0;
+uint16_t k = 0;
+uint16_t l = 0;
+
+uint16_t while_counter = 0;
 
 /**
  * Request a state transition to a new state
@@ -150,10 +160,27 @@ uint8_t delay_and_check_flag(uint16_t amount)
   return DELAY_COMPLETED;
 }
 
+// check if end stops are shown as "LOW" and return 1
+// if not, return 0
+uint8_t check_end_stops()
+{
+  // Both endstops have to be low when in idle mode
+  // since they are normally closed to GND.
+  if (
+      !bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN) ||
+      !bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
+  {
+    return FLAG_FALSE;
+  }
+
+  return FLAG_TRUE;
+}
+
 // ~~~~~~~~~~~~~~~~~~ ISR ~~~~~~~~~~~~~~~~~~
 // INT0 = PD2 = green = upper switch was depressed (low -> high transition)
 ISR(INT0_vect)
 {
+  wdt_reset();
   // the motor was moving up and the upper limit switch has been pressed
   if (current_state == STATE_MOVING_UP && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
   {
@@ -168,6 +195,7 @@ ISR(INT0_vect)
 
 ISR(INT1_vect)
 {
+  wdt_reset();
   // the motor was moving down and the lower limit switch has been pressed
   if (current_state == STATE_MOVING_DOWN && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
   {
@@ -186,24 +214,56 @@ ISR(WDT_vect)
   ;
 }
 
+ISR(PCINT0_vect)
+{
+  wdt_reset();
+  // figure out which pin caused the interrupt and if any was pressed or just released
+  if (bit_is_clear(PINB, PB0))
+  {
+    if ((current_state == STATE_IDLE_UP || current_state == STATE_IDLE_DOWN) && set_light_level_flag == FLAG_FALSE)
+    {
+      set_light_level_flag = FLAG_TRUE;
+    }
+  }
+  else if (bit_is_clear(PINB, PB1))
+  {
+    if (current_state == STATE_IDLE_UP)
+    {
+      request_transition(STATE_MOVING_DOWN);
+    }
+  }
+  else if (bit_is_clear(PINB, PB2))
+  {
+    if (current_state == STATE_IDLE_DOWN)
+    {
+      request_transition(STATE_MOVING_UP);
+    }
+  }
+}
+
 // ##########################################################################
 int main()
 {
   // startup stuff
   led_init();
+  led_debug_init();
   motor_init();
 
   // read target light level from eeprom.
   // if 0, set the default value
   // first wait for eeprom to be ready
-  while (!eeprom_is_ready())
+  while_counter = 0;
+  while (!eeprom_is_ready() && while_counter < 10000)
   {
-    ;
+    while_counter++;
   }
 
-  target_light_level = eeprom_read_byte((uint8_t *)EEPROM_LIGHT_LEVEL_ADDRESS);
+  if (while_counter < 10000)
+  {
+    target_light_level = eeprom_read_word((uint16_t *)EEPROM_LIGHT_LEVEL_ADDRESS);
+  }
 
-  if (target_light_level == 0)
+  if (target_light_level == 0 || target_light_level == 0xffff)
   {
     target_light_level = FALLBACK_TARGET_LIGHT_LEVEL;
   }
@@ -219,6 +279,14 @@ int main()
 
   // enable both interrupts
   EIMSK |= (1 << INT1) | (1 << INT0);
+
+  // setting up Pin change interrupts on PB0 - PB2
+  // these values are not defined, as the PCINT has to be on this port and other pins are not available
+  DDRB &= ~((1 << PB0) | (1 << PB1) | (1 << PB2));
+  PORTB |= (1 << PB0) | (1 << PB1) | (1 << PB2); // pullups active
+
+  PCICR |= (1 << PCIE0);
+  PCMSK0 |= (1 << PCINT2) | (1 << PCINT1) | (1 << PCINT0);
 
   // show led startup animation
   led_on();
@@ -240,15 +308,13 @@ int main()
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   sleep_enable();
 
+  // configure watchdog to interrupt about 8 seconds
+  MCUSR &= ~(1 << WDRF);
+  WDTCSR |= (1 << WDCE) | (1 << WDE);
+  WDTCSR = 0b01100001;
+
   // enable interrupts globally
   sei();
-
-  // Do not really understand this line. old version had it.
-  MCUSR &= ~(1 << WDRF);
-
-  // configure watchdog to interrupt about 8 seconds
-  WDTCSR |= (1 << WDCE);
-  WDTCSR |= (1 << WDIE) | (1 << WDP3) | (1 << WDP0);
 
   // if the upper end switch is pressed already,
   // prevent damage by setting the release_upper state
@@ -315,6 +381,13 @@ int main()
       if (state_transition_flag == FLAG_TRUE)
       {
         state_transition_flag = FLAG_FALSE;
+
+        if (check_end_stops() == FLAG_FALSE)
+        {
+          request_transition(STATE_ERROR);
+          break;
+        }
+
         // reset LED
         led_off();
         // start moving up
@@ -351,6 +424,13 @@ int main()
       if (state_transition_flag == FLAG_TRUE)
       {
         state_transition_flag = FLAG_FALSE;
+
+        if (check_end_stops() == FLAG_FALSE)
+        {
+          request_transition(STATE_ERROR);
+          break;
+        }
+
         // reset LED
         led_off();
         // start moving down
@@ -475,10 +555,17 @@ int main()
       }
 
       // show idle state animation
+      led_off();
+      delay_consumed = delay_and_check_flag(50);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        goto switch_state_start;
+      }
+
       for (k = 0; k < 2; k++)
       {
         led_on();
-        delay_consumed = delay_and_check_flag(150);
+        delay_consumed = delay_and_check_flag(100);
         if (delay_consumed == DELAY_ABORTED)
         {
           goto switch_state_start;
@@ -493,13 +580,25 @@ int main()
       }
 
       // measure brightness
-      analog_measure_value(ANALOG_CHANNEL_LIGHT, &light_level);
+      light_level = analog_measure_value(ANALOG_CHANNEL_LIGHT);
+
+      // used to debug analog values
+      // led_debug_on();
+      // for(uint16_t m = 0; m < target_light_level; m++) {
+      //   _delay_ms(1);
+      // }
+      // led_debug_off();
 
       if (set_light_level_flag == FLAG_TRUE)
       {
         // if the button was pressed set new value for brightness
         // wanted behaviour: If pressed while in STATE_IDLE_UP, the door should go into
         // closing behavior on the next blink
+
+        eeprom_write_word((uint16_t *)EEPROM_LIGHT_LEVEL_ADDRESS, light_level);
+        target_light_level = light_level;
+
+        set_light_level_flag = FLAG_FALSE;
       }
 
       if (light_level < target_light_level)
@@ -519,7 +618,8 @@ int main()
         break;
       }
 
-      _delay_ms(1000);
+      // _delay_ms(8000);
+      // does not work for some reason?
       sleep_cpu();
 
       led_off();
@@ -558,29 +658,63 @@ int main()
       }
 
       // show idle state animation
+      led_off();
+      delay_consumed = delay_and_check_flag(50);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        goto switch_state_start;
+      }
+
       led_on();
-      delay_consumed = delay_and_check_flag(100);
+      delay_consumed = delay_and_check_flag(70);
       if (delay_consumed == DELAY_ABORTED)
       {
         break;
       }
 
       led_off();
-      delay_consumed = delay_and_check_flag(100);
+      delay_consumed = delay_and_check_flag(50);
       if (delay_consumed == DELAY_ABORTED)
       {
-        break;
+        goto switch_state_start;
       }
 
-      // measure brightness (again?)
+      // measure brightness
+      light_level = analog_measure_value(ANALOG_CHANNEL_LIGHT);
+
       if (set_light_level_flag == FLAG_TRUE)
       {
         // if the button was pressed set new value for brightness
         // wanted behaviour: If pressed while in STATE_IDLE_UP, the door should go into
         // closing behavior on the next blink
-      }
-      led_off();
 
+        eeprom_write_word((uint16_t *)EEPROM_LIGHT_LEVEL_ADDRESS, light_level);
+        target_light_level = light_level;
+
+        set_light_level_flag = FLAG_FALSE;
+      }
+
+      if ((light_level - LIGHT_LEVEL_DOWN_SUBTRACT_VALUE) > target_light_level)
+      {
+        idle_tick_count++;
+        led_on();
+      }
+      else
+      {
+        idle_tick_count = 0;
+        led_off();
+      }
+
+      if (idle_tick_count > IDLE_TO_MOVING_TICK_COUNT)
+      {
+        request_transition(STATE_MOVING_UP);
+        break;
+      }
+
+      // _delay_ms(8000);
+      sleep_cpu();
+
+      led_off();
       break;
 
     // this should never happen :)
