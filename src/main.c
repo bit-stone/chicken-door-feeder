@@ -3,6 +3,7 @@
 #include <avr/interrupt.h>
 #include <util/delay.h>
 #include <avr/sleep.h>
+#include <avr/eeprom.h>
 
 #include "led.h"
 #include "motor.h"
@@ -52,6 +53,9 @@
 // channel on which the light level is measured
 #define ANALOG_CHANNEL_LIGHT 0
 
+// amount of ticks after which idle state changes to moving
+#define IDLE_TO_MOVING_TICK_COUNT 20
+
 // if set, the transition will be done
 // afterwards, flag has to be reset to zero
 uint8_t state_transition_flag = FLAG_TRUE;
@@ -70,6 +74,9 @@ uint8_t delay_consumed = 0;
 uint8_t movement_tick_count = 0;
 uint8_t release_tick_count = 0;
 
+// amount of ticks for idle state change
+uint8_t idle_tick_count = 0;
+
 // used to store the currently measured light level
 uint16_t light_level = 0;
 
@@ -81,6 +88,8 @@ uint16_t target_light_level = 0;
 // IMPORTANT: This is only used when the EEPROM value is read as 0!
 // Otherwise the eeprom value will be used.
 #define FALLBACK_TARGET_LIGHT_LEVEL 500
+
+#define EEPROM_LIGHT_LEVEL_ADDRESS 69 // nice
 
 // counter
 uint8_t k = 0;
@@ -149,14 +158,11 @@ ISR(INT0_vect)
   if (current_state == STATE_MOVING_UP && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
   {
     request_transition(STATE_RELEASING_UP);
-    return;
   }
-
   // the motor was moving down (to release) and the upper limit switch has been released
-  if (current_state == STATE_RELEASING_UP && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
+  else if (current_state == STATE_RELEASING_UP && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
   {
     request_transition(STATE_IDLE_UP);
-    return;
   }
 }
 
@@ -166,15 +172,18 @@ ISR(INT1_vect)
   if (current_state == STATE_MOVING_DOWN && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
   {
     request_transition(STATE_RELEASING_DOWN);
-    return;
   }
-
   // the motor was moving up (to release) and the lower limit switch has been released
-  if (current_state == STATE_RELEASING_DOWN && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
+  else if (current_state == STATE_RELEASING_DOWN && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
   {
     request_transition(STATE_IDLE_DOWN);
-    return;
   }
+}
+
+// only used to wake up. Might be useful later.
+ISR(WDT_vect)
+{
+  ;
 }
 
 // ##########################################################################
@@ -186,6 +195,13 @@ int main()
 
   // read target light level from eeprom.
   // if 0, set the default value
+  // first wait for eeprom to be ready
+  while (!eeprom_is_ready())
+  {
+    ;
+  }
+
+  target_light_level = eeprom_read_byte((uint8_t *)EEPROM_LIGHT_LEVEL_ADDRESS);
 
   if (target_light_level == 0)
   {
@@ -220,8 +236,19 @@ int main()
   led_off();
   _delay_ms(500);
 
+  // set sleep mode
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+
   // enable interrupts globally
   sei();
+
+  // Do not really understand this line. old version had it.
+  MCUSR &= ~(1 << WDRF);
+
+  // configure watchdog to interrupt about 8 seconds
+  WDTCSR |= (1 << WDCE);
+  WDTCSR |= (1 << WDIE) | (1 << WDP3) | (1 << WDP0);
 
   // if the upper end switch is pressed already,
   // prevent damage by setting the release_upper state
@@ -234,6 +261,7 @@ int main()
   // loop
   while (1)
   {
+  switch_state_start:
     switch (current_state)
     {
     // ERROR STATE
@@ -260,6 +288,20 @@ int main()
 
       led_off();
       delay_consumed = delay_and_check_flag(250);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      led_on();
+      delay_consumed = delay_and_check_flag(50);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      led_off();
+      delay_consumed = delay_and_check_flag(750);
       if (delay_consumed == DELAY_ABORTED)
       {
         break;
@@ -408,28 +450,48 @@ int main()
         // stop all movement
         motor_stop();
 
+        // reset idle ticks
+        idle_tick_count = 0;
+
         // show idle transition led signal
-        for (k = 0; k < 5; k++)
+        for (k = 0; k < 3; k++)
         {
           led_off();
-          delay_consumed = delay_and_check_flag(100);
+          delay_consumed = delay_and_check_flag(50);
           if (delay_consumed == DELAY_ABORTED)
           {
-            break;
+            goto switch_state_start;
           }
 
           led_on();
-          delay_consumed = delay_and_check_flag(400);
+          delay_consumed = delay_and_check_flag(50);
           if (delay_consumed == DELAY_ABORTED)
           {
-            break;
+            goto switch_state_start;
           }
+        }
 
-          led_off();
+        led_off();
+      }
+
+      // show idle state animation
+      for (k = 0; k < 2; k++)
+      {
+        led_on();
+        delay_consumed = delay_and_check_flag(150);
+        if (delay_consumed == DELAY_ABORTED)
+        {
+          goto switch_state_start;
+        }
+
+        led_off();
+        delay_consumed = delay_and_check_flag(50);
+        if (delay_consumed == DELAY_ABORTED)
+        {
+          goto switch_state_start;
         }
       }
 
-      led_on();
       // measure brightness
       analog_measure_value(ANALOG_CHANNEL_LIGHT, &light_level);
 
@@ -440,8 +502,27 @@ int main()
         // closing behavior on the next blink
       }
 
-      led_off();
+      if (light_level < target_light_level)
+      {
+        idle_tick_count++;
+        led_on();
+      }
+      else
+      {
+        idle_tick_count = 0;
+        led_off();
+      }
 
+      if (idle_tick_count > IDLE_TO_MOVING_TICK_COUNT)
+      {
+        request_transition(STATE_MOVING_DOWN);
+        break;
+      }
+
+      _delay_ms(1000);
+      sleep_cpu();
+
+      led_off();
       break;
     // ~~~~~~~~~~~~~~~~~~~~~~ STATE_IDLE_DOWN ~~~~~~~~~~~~~~~~~~~~
     case STATE_IDLE_DOWN:
@@ -452,29 +533,45 @@ int main()
         led_off();
         // stop all movement
         motor_stop();
+        // reset idle ticks
+        idle_tick_count = 0;
 
         // show idle transition led signal
         for (k = 0; k < 2; k++)
         {
           led_off();
-          delay_consumed = delay_and_check_flag(100);
+          delay_consumed = delay_and_check_flag(50);
           if (delay_consumed == DELAY_ABORTED)
           {
-            break;
+            goto switch_state_start;
           }
 
           led_on();
-          delay_consumed = delay_and_check_flag(400);
+          delay_consumed = delay_and_check_flag(200);
           if (delay_consumed == DELAY_ABORTED)
           {
-            break;
+            goto switch_state_start;
           }
         }
 
         led_off();
       }
 
+      // show idle state animation
       led_on();
+      delay_consumed = delay_and_check_flag(100);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      led_off();
+      delay_consumed = delay_and_check_flag(100);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
       // measure brightness (again?)
       if (set_light_level_flag == FLAG_TRUE)
       {
