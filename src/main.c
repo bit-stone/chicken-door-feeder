@@ -95,13 +95,14 @@ uint16_t target_light_level = 0;
 // To go up, it has to be a bit brigther compared to going down.
 // Also: To go down, it has to be a bit darker compared to going up.
 // This factor should be < 1.0
-#define LIGHT_LEVEL_DOWN_SUBTRACT_VALUE 25
+#define LIGHT_LEVEL_DOWN_SUBTRACT_VALUE 15
 
 #define EEPROM_LIGHT_LEVEL_ADDRESS 4
 
 // counter
 uint16_t k = 0;
 uint16_t l = 0;
+uint16_t m = 0;
 
 uint16_t while_counter = 0;
 
@@ -158,6 +159,45 @@ uint8_t delay_and_check_flag(uint16_t amount)
   }
 
   return DELAY_COMPLETED;
+}
+
+void write_new_target_light_level(uint16_t new_level)
+{
+  // if the button was pressed set new value for brightness
+  // wanted behaviour: If pressed while in STATE_IDLE_UP, the door should go into
+  // closing behavior on the next blink
+
+  eeprom_write_word((uint16_t *)EEPROM_LIGHT_LEVEL_ADDRESS, new_level);
+  target_light_level = new_level;
+
+  // might be useful to output the new light level somehow...
+  led_debug_off();
+  delay_and_check_flag(100);
+  for (m = 11; m >= 1; m--)
+  {
+    led_debug_on();
+    delay_consumed = delay_and_check_flag(200);
+
+    led_debug_off();
+    delay_consumed = delay_and_check_flag(200);
+
+    if (((new_level >> (m - 1)) & 0b1 )== 1)
+    {
+      led_debug_on();
+    }
+    else
+    {
+      led_debug_off();
+    }
+    delay_consumed = delay_and_check_flag(200);
+
+    led_debug_off();
+    delay_consumed = delay_and_check_flag(1000);
+
+    if(delay_consumed == FLAG_FALSE) {
+      return;
+    }
+  }
 }
 
 // check if end stops are shown as "LOW" and return 1
@@ -559,7 +599,7 @@ int main()
       delay_consumed = delay_and_check_flag(50);
       if (delay_consumed == DELAY_ABORTED)
       {
-        goto switch_state_start;
+        break;
       }
 
       for (k = 0; k < 2; k++)
@@ -591,13 +631,7 @@ int main()
 
       if (set_light_level_flag == FLAG_TRUE)
       {
-        // if the button was pressed set new value for brightness
-        // wanted behaviour: If pressed while in STATE_IDLE_UP, the door should go into
-        // closing behavior on the next blink
-
-        eeprom_write_word((uint16_t *)EEPROM_LIGHT_LEVEL_ADDRESS, light_level);
-        target_light_level = light_level;
-
+        write_new_target_light_level(light_level);
         set_light_level_flag = FLAG_FALSE;
       }
 
@@ -662,7 +696,7 @@ int main()
       delay_consumed = delay_and_check_flag(50);
       if (delay_consumed == DELAY_ABORTED)
       {
-        goto switch_state_start;
+        break;
       }
 
       led_on();
@@ -676,7 +710,7 @@ int main()
       delay_consumed = delay_and_check_flag(50);
       if (delay_consumed == DELAY_ABORTED)
       {
-        goto switch_state_start;
+        break;
       }
 
       // measure brightness
@@ -684,17 +718,11 @@ int main()
 
       if (set_light_level_flag == FLAG_TRUE)
       {
-        // if the button was pressed set new value for brightness
-        // wanted behaviour: If pressed while in STATE_IDLE_UP, the door should go into
-        // closing behavior on the next blink
-
-        eeprom_write_word((uint16_t *)EEPROM_LIGHT_LEVEL_ADDRESS, light_level);
-        target_light_level = light_level;
-
+        write_new_target_light_level(light_level);
         set_light_level_flag = FLAG_FALSE;
       }
 
-      if ((light_level - LIGHT_LEVEL_DOWN_SUBTRACT_VALUE) > target_light_level)
+      if (light_level > (target_light_level + LIGHT_LEVEL_DOWN_SUBTRACT_VALUE))
       {
         idle_tick_count++;
         led_on();
