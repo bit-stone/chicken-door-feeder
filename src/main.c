@@ -106,6 +106,14 @@ uint16_t m = 0;
 
 uint16_t while_counter = 0;
 
+// states of buttons (updated in timer overflow isr)
+uint8_t limit_switch_up_pressed = FLAG_FALSE;
+uint8_t limit_switch_down_pressed = FLAG_FALSE;
+
+// counter for debouncing
+uint8_t limit_switch_up_trans_counter = 0;
+uint8_t limit_switch_down_trans_counter = 0;
+
 /**
  * Request a state transition to a new state
  */
@@ -181,7 +189,7 @@ void write_new_target_light_level(uint16_t new_level)
     led_debug_off();
     delay_consumed = delay_and_check_flag(200);
 
-    if (((new_level >> (m - 1)) & 0b1 )== 1)
+    if (((new_level >> (m - 1)) & 0b1) == 1)
     {
       led_debug_on();
     }
@@ -194,7 +202,8 @@ void write_new_target_light_level(uint16_t new_level)
     led_debug_off();
     delay_consumed = delay_and_check_flag(1000);
 
-    if(delay_consumed == FLAG_FALSE) {
+    if (delay_consumed == FLAG_FALSE)
+    {
       return;
     }
   }
@@ -216,37 +225,57 @@ uint8_t check_end_stops()
   return FLAG_TRUE;
 }
 
-// ~~~~~~~~~~~~~~~~~~ ISR ~~~~~~~~~~~~~~~~~~
-// INT0 = PD2 = green = upper switch was depressed (low -> high transition)
-ISR(INT0_vect)
+void enable_timer_0()
 {
-  wdt_reset();
-  // the motor was moving up and the upper limit switch has been pressed
-  if (current_state == STATE_MOVING_UP && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
-  {
-    request_transition(STATE_RELEASING_UP);
-  }
-  // the motor was moving down (to release) and the upper limit switch has been released
-  else if (current_state == STATE_RELEASING_UP && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
-  {
-    request_transition(STATE_IDLE_UP);
-  }
+  // setting up a timer
+  // only running in the moving states
+  // setting prescaler to 64
+  TCCR0B |= (1 << CS01) | (1 << CS00);
+
+  // enable overflow interrupt
+  TIMSK0 |= (1 << TOIE0);
+
+  // enable the timer
+  PRR &= ~(1 << PRTIM0);
 }
 
-ISR(INT1_vect)
+void disable_timer_0()
 {
-  wdt_reset();
-  // the motor was moving down and the lower limit switch has been pressed
-  if (current_state == STATE_MOVING_DOWN && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
-  {
-    request_transition(STATE_RELEASING_DOWN);
-  }
-  // the motor was moving up (to release) and the lower limit switch has been released
-  else if (current_state == STATE_RELEASING_DOWN && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
-  {
-    request_transition(STATE_IDLE_DOWN);
-  }
+
+  PRR |= (1 << PRTIM0);
 }
+// ~~~~~~~~~~~~~~~~~~ ISR ~~~~~~~~~~~~~~~~~~
+// INT0 = PD2 = green = upper switch was depressed (low -> high transition)
+// UPDATE: Disabled due to debouncing issues. Using polling and timers instead.
+// ISR(INT0_vect)
+// {
+//   wdt_reset();
+//   // the motor was moving up and the upper limit switch has been pressed
+//   if (current_state == STATE_MOVING_UP && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
+//   {
+//     request_transition(STATE_RELEASING_UP);
+//   }
+//   // the motor was moving down (to release) and the upper limit switch has been released
+//   else if (current_state == STATE_RELEASING_UP && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
+//   {
+//     request_transition(STATE_IDLE_UP);
+//   }
+// }
+
+// ISR(INT1_vect)
+// {
+//   wdt_reset();
+//   // the motor was moving down and the lower limit switch has been pressed
+//   if (current_state == STATE_MOVING_DOWN && bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
+//   {
+//     request_transition(STATE_RELEASING_DOWN);
+//   }
+//   // the motor was moving up (to release) and the lower limit switch has been released
+//   else if (current_state == STATE_RELEASING_DOWN && bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
+//   {
+//     request_transition(STATE_IDLE_DOWN);
+//   }
+// }
 
 // only used to wake up. Might be useful later.
 ISR(WDT_vect)
@@ -281,6 +310,104 @@ ISR(PCINT0_vect)
   }
 }
 
+ISR(TIMER0_OVF_vect)
+{
+  led_debug_toggle();
+
+  // check button state and update transition counter
+  if (bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
+  {
+    if (limit_switch_up_pressed == FLAG_TRUE)
+    {
+      limit_switch_up_trans_counter = 0;
+    }
+    else if (limit_switch_up_pressed == FLAG_FALSE)
+    {
+      limit_switch_up_trans_counter++;
+    }
+  }
+  else if (bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_UP_PIN))
+  {
+    if (limit_switch_up_pressed == FLAG_TRUE)
+    {
+      limit_switch_up_trans_counter++;
+    }
+    else if (limit_switch_up_pressed == FLAG_FALSE)
+    {
+      limit_switch_up_trans_counter = 0;
+    }
+  }
+
+  // set new state if needed
+  if (limit_switch_up_trans_counter > 10)
+  {
+    limit_switch_up_pressed = (limit_switch_up_pressed == FLAG_TRUE) ? FLAG_FALSE : FLAG_TRUE;
+    limit_switch_up_trans_counter = 0;
+  }
+
+  // check the same for down switch
+  if (bit_is_set(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
+  {
+    if (limit_switch_down_pressed == FLAG_TRUE)
+    {
+      limit_switch_down_trans_counter = 0;
+    }
+    else if (limit_switch_down_pressed == FLAG_FALSE)
+    {
+      limit_switch_down_trans_counter++;
+    }
+  }
+  else if (bit_is_clear(LIMIT_SWITCH_PIN, LIMIT_SWITCH_DOWN_PIN))
+  {
+    if (limit_switch_down_pressed == FLAG_TRUE)
+    {
+      limit_switch_down_trans_counter++;
+    }
+    else if (limit_switch_down_pressed == FLAG_FALSE)
+    {
+      limit_switch_down_trans_counter = 0;
+    }
+  }
+
+  // set new state if needed
+  if (limit_switch_down_trans_counter > 10)
+  {
+    limit_switch_down_pressed = (limit_switch_down_pressed == FLAG_TRUE) ? FLAG_FALSE : FLAG_TRUE;
+    limit_switch_down_trans_counter = 0;
+  }
+
+  // now check for states and possible state transitions
+  switch (current_state)
+  {
+  case STATE_MOVING_UP:
+    if (limit_switch_up_pressed == FLAG_TRUE)
+    {
+      request_transition(STATE_RELEASING_UP);
+    }
+    break;
+  case STATE_MOVING_DOWN:
+    if (limit_switch_down_pressed == FLAG_TRUE)
+    {
+      request_transition(STATE_RELEASING_DOWN);
+    }
+    break;
+  case STATE_RELEASING_UP:
+    if (limit_switch_up_pressed == FLAG_FALSE)
+    {
+      request_transition(STATE_IDLE_UP);
+    }
+    break;
+  case STATE_RELEASING_DOWN:
+    if (limit_switch_down_pressed == FLAG_FALSE)
+    {
+      request_transition(STATE_IDLE_DOWN);
+    }
+    break;
+  default:
+    break;
+  }
+}
+
 // ##########################################################################
 int main()
 {
@@ -308,17 +435,21 @@ int main()
     target_light_level = FALLBACK_TARGET_LIGHT_LEVEL;
   }
 
-  // setting both interrupts to trigger on low-high-transition
+  // setting both end switch to be inputs
   // and have the pullup enabled
   LIMIT_SWITCH_DDR &= ~((1 << LIMIT_SWITCH_UP_PIN) | 1 << LIMIT_SWITCH_DOWN_PIN);
   LIMIT_SWITCH_PORT |= (1 << LIMIT_SWITCH_UP_PIN) | (1 << LIMIT_SWITCH_DOWN_PIN);
 
+  // UPDATE: There is a debouncing issue and hardware did not solve it.
+  // instead, I will use a timer and polling during the moving states for the end switches
+  // as it is very easy to debounce there.
+  // PCINT will stay, as they only set a flag and debouncing is not an issue.
   // setting both interrupts to trigger on any logic level change
   // (low->high for endstop, high->low for release needed)
-  EICRA |= (1 << ISC10) | (1 << ISC00);
+  // EICRA |= (1 << ISC10) | (1 << ISC00);
 
   // enable both interrupts
-  EIMSK |= (1 << INT1) | (1 << INT0);
+  // EIMSK |= (1 << INT1) | (1 << INT0);
 
   // setting up Pin change interrupts on PB0 - PB2
   // these values are not defined, as the PCINT has to be on this port and other pins are not available
@@ -352,6 +483,8 @@ int main()
   MCUSR &= ~(1 << WDRF);
   WDTCSR |= (1 << WDCE) | (1 << WDE);
   WDTCSR = 0b01100001;
+  // Important note: This values have to be set within 4 clock cycles.
+  // since the shifting might be not optimized, have to set a defined value here
 
   // enable interrupts globally
   sei();
@@ -382,6 +515,8 @@ int main()
         motor_stop();
         // reset the LED
         led_off();
+        // disable timer
+        disable_timer_0();
       }
 
       // blink kind of fast
@@ -427,11 +562,14 @@ int main()
           request_transition(STATE_ERROR);
           break;
         }
+        // enable timer
+        enable_timer_0();
 
         // reset LED
         led_off();
         // start moving up
         motor_move_up();
+
         // reset move tick count
         movement_tick_count = 0;
       }
@@ -471,6 +609,9 @@ int main()
           break;
         }
 
+        // enable timer
+        enable_timer_0();
+
         // reset LED
         led_off();
         // start moving down
@@ -508,6 +649,10 @@ int main()
       if (state_transition_flag == FLAG_TRUE)
       {
         state_transition_flag = FLAG_FALSE;
+
+        // enable timer
+        enable_timer_0();
+
         // reset LED (always on in release state)
         led_on();
         // start moving down (to release upper switch)
@@ -535,6 +680,10 @@ int main()
       if (state_transition_flag == FLAG_TRUE)
       {
         state_transition_flag = FLAG_FALSE;
+
+        // enable timer
+        enable_timer_0();
+
         // reset LED (always on in release state)
         led_on();
         // start moving up
@@ -564,6 +713,9 @@ int main()
       if (state_transition_flag == FLAG_TRUE)
       {
         state_transition_flag = FLAG_FALSE;
+
+        // disable timer
+        disable_timer_0();
 
         // reset LED
         led_off();
@@ -663,6 +815,9 @@ int main()
       if (state_transition_flag == FLAG_TRUE)
       {
         state_transition_flag = FLAG_FALSE;
+
+        // disable timer
+        disable_timer_0();
         // reset LED
         led_off();
         // stop all movement
