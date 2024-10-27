@@ -243,6 +243,7 @@ void disable_timer_0()
 {
 
   PRR |= (1 << PRTIM0);
+  led_debug_off();
 }
 // ~~~~~~~~~~~~~~~~~~ ISR ~~~~~~~~~~~~~~~~~~
 // INT0 = PD2 = green = upper switch was depressed (low -> high transition)
@@ -463,12 +464,12 @@ int main()
   led_on();
   _delay_ms(50);
   led_off();
-  _delay_ms(50);
+  _delay_ms(150);
 
   led_on();
-  _delay_ms(50);
+  _delay_ms(250);
   led_off();
-  _delay_ms(50);
+  _delay_ms(150);
 
   led_on();
   _delay_ms(50);
@@ -528,7 +529,21 @@ int main()
       }
 
       led_off();
-      delay_consumed = delay_and_check_flag(250);
+      delay_consumed = delay_and_check_flag(150);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      led_on();
+      delay_consumed = delay_and_check_flag(50);
+      if (delay_consumed == DELAY_ABORTED)
+      {
+        break;
+      }
+
+      led_off();
+      delay_consumed = delay_and_check_flag(150);
       if (delay_consumed == DELAY_ABORTED)
       {
         break;
